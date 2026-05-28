@@ -414,7 +414,28 @@ void TaskLDR(void* pvParameters) {
 }
 
 // ══════════════════════════════════════════════════
-// TASK 7: SERIAL MONITOR INTERAKTIF
+// TASK 7: INDIKATOR SLOT (LED HIJAU/MERAH)
+// ══════════════════════════════════════════════════
+void TaskSlotIndicator(void* pvParameters) {
+  for (;;) {
+    int slot;
+    if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(20)) == pdTRUE) {
+      slot = slotTerisi;
+      if (slot < KAPASITAS_SLOT) {
+        digitalWrite(PIN_LED_HIJAU, HIGH);
+        digitalWrite(PIN_LED_MERAH, LOW);
+      } else {
+        digitalWrite(PIN_LED_HIJAU, LOW);
+        digitalWrite(PIN_LED_MERAH, HIGH);
+      }
+      xSemaphoreGive(xMutex_SharedData);
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// ══════════════════════════════════════════════════
+// TASK 8: SERIAL MONITOR INTERAKTIF
 // ══════════════════════════════════════════════════
 void TaskSerial(void* pvParameters) {
   vTaskDelay(pdMS_TO_TICKS(2000)); // tunggu sistem ready
@@ -577,6 +598,7 @@ void setup() {
   xTaskCreatePinnedToCore(TaskBuzzerLED,  "BuzzerLED",  2048, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(TaskDisplay,    "Display",    4096, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(TaskLDR,        "LDR",        1024, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(TaskSlotIndicator, "SlotInd", 1024, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(TaskSerial, "Serial", 3072, NULL, 1, NULL, 0);
 
   Serial.println("=== SISTEM PARKIR ESP32 + FreeRTOS AKTIF ===");
