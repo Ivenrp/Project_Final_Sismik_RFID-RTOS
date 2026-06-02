@@ -2,7 +2,10 @@
 #include <MFRC522.h>
 #include <ESP32Servo.h>
 
-#define SS_PIN      5
+#define SDA_PIN      5
+#define SCK_PIN     18
+#define MISO_PIN    19
+#define MOSI_PIN    23
 #define RST_PIN     27
 
 #define SERVO_PIN   13
@@ -14,7 +17,7 @@
 MFRC522 rfid(SS_PIN, RST_PIN);
 Servo gateServo;
 
-// GANTI DENGAN UID KARTU KAMU
+// GANTI UID CARD FRID
 byte authorizedUID[4] = {0x93, 0x4A, 0x2F, 0x1C};
 
 volatile bool carDetected = false;
@@ -166,7 +169,7 @@ void setup()
 
     ledcAttach(BUZZER_PIN, 2000, 8);
 
-    SPI.begin(18, 19, 23, 5);
+    SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SDA_PIN);
 
     rfid.PCD_Init();
 
