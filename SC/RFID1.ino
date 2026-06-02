@@ -14,7 +14,7 @@
 #define TRIG_PIN    32
 #define ECHO_PIN    33
 
-MFRC522 rfid(SS_PIN, RST_PIN);
+MFRC522 rfid(SDA_PIN, RST_PIN);
 Servo gateServo;
 
 // GANTI UID CARD FRID
