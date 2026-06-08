@@ -40,31 +40,7 @@ Servo             servoPalang;
 // UID KARTU YANG DIIZINKAN
 byte authorizedUID[4] = { 0x52, 0x89, 0x16, 0x05 };
 
-// SEMAPHORE
-SemaphoreHandle_t echoSem;
-SemaphoreHandle_t lcdMutex;
 
-// ISR ULTRASONIC
-volatile unsigned long echoMulai  = 0;
-volatile unsigned long durasiEcho = 0;
-
-void IRAM_ATTR isrEcho()
-{
-  if (digitalRead(ECHO_PIN) == HIGH)
-  {
-    echoMulai = micros();
-  }
-  else
-  {
-    if (echoMulai > 0)
-    {
-      durasiEcho = micros() - echoMulai;
-      BaseType_t wake = pdFALSE;
-      xSemaphoreGiveFromISR(echoSem, &wake);
-      portYIELD_FROM_ISR(wake);
-    }
-  }
-}
 
 // STATE GLOBAL
 volatile bool mobilDetect = false;
@@ -80,24 +56,18 @@ TaskHandle_t hUltrasonik;
 TaskHandle_t hRFID;
 TaskHandle_t hLDR;
 
-// HELPER: LCD dengan mutex
 void lcdPrint(const char* line0, const char* line1)
 {
-  xSemaphoreTake(lcdMutex, portMAX_DELAY);
   lcd.clear();
   lcd.setCursor(0, 0); lcd.print(line0);
   lcd.setCursor(0, 1); lcd.print(line1);
-  xSemaphoreGive(lcdMutex);
 }
 
-// HELPER: LCD standby
 void lcdSiap()
 {
-  xSemaphoreTake(lcdMutex, portMAX_DELAY);
   lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("SMART PARKING");
-  lcd.setCursor(0, 1); lcd.print("SIAP...");
-  xSemaphoreGive(lcdMutex);
+  lcd.setCursor(0, 0); lcd.print("SELAMAT DATANG");
+  lcd.setCursor(0, 1); lcd.print(" ");
 }
 
 // HELPER: cocokkan UID
@@ -109,28 +79,20 @@ bool uidMatch(MFRC522::Uid *uid)
   return true;
 }
 
-// HELPER: baca jarak 1x via binary semaphore
 int bacaJarak()
 {
-  xSemaphoreTake(echoSem, 0);
-
-  echoMulai  = 0;
-  durasiEcho = 0;
-
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(4);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  if (xSemaphoreTake(echoSem, pdMS_TO_TICKS(35)) == pdTRUE)
-  {
-    int d = (int)(durasiEcho * 0.034f / 2.0f);
-    if (d < MIN_JARAK || d > MAX_JARAK) return -1;
-    return d;
-  }
+  long durasi = pulseIn(ECHO_PIN, HIGH, 35000);
+  if (durasi == 0) return -1;
 
-  return -1;
+  int d = (int)(durasi * 0.034f / 2.0f);
+  if (d < MIN_JARAK || d > MAX_JARAK) return -1;
+  return d;
 }
 
 // HELPER: median filter
@@ -251,13 +213,11 @@ void taskUltrasonic(void *pv)
         }
         else
         {
-          xSemaphoreTake(lcdMutex, portMAX_DELAY);
           lcd.clear();
           lcd.setCursor(0, 0); lcd.print("MENUTUP PALANG");
           lcd.setCursor(0, 1); lcd.print("TUTUP ");
           lcd.print(sisa);
           lcd.print(" dtk");
-          xSemaphoreGive(lcdMutex);
         }
         break;
       }
@@ -325,11 +285,9 @@ void taskRFID(void *pv)
     {
       Serial.println("[RFID] >> AKSES DITOLAK — kartu tidak dikenal");
 
-      xSemaphoreTake(lcdMutex, portMAX_DELAY);
       lcd.clear();
       lcd.setCursor(0, 0); lcd.print("AKSES DITOLAK");
       lcd.setCursor(0, 1); lcd.print("KARTU INVALID");
-      xSemaphoreGive(lcdMutex);
 
       for (int i = 0; i < 3; i++)
       {
@@ -384,9 +342,6 @@ void setup()
   Serial.println("       SMART PARKING — ESP32 FreeRTOS      ");
   Serial.println("============================================");
 
-  echoSem   = xSemaphoreCreateBinary();
-  lcdMutex  = xSemaphoreCreateMutex();
-
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   digitalWrite(TRIG_PIN, LOW);
@@ -407,9 +362,6 @@ void setup()
   servoPalang.write(SERVO_TUTUP);
   Serial.println("[SERVO] Init TUTUP 10°");
   delay(500);
-
-  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), isrEcho, CHANGE);
-  Serial.println("[ISR]  ECHO terpasang (GPIO " + String(ECHO_PIN) + ")");
 
   // TASK FreeRTOS
   xTaskCreatePinnedToCore(
