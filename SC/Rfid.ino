@@ -1,546 +1,265 @@
-// ============================================================
-// SISTEM PARKIR OTOMATIS - ESP32 + FreeRTOS
-// Mata Kuliah  : Sistem Mikrokontroler (TK244004)
-// Universitas  : Universitas Jenderal Soedirman
-// ── UPGRADE: FreeRTOS Multitasking + OLED SSD1306 ──────────
-// ============================================================
+// SMART PARKING — ESP32 + FreeRTOS
 
-#include <Arduino.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include <ESP32Servo.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "freertos/queue.h"
+#include <LiquidCrystal_I2C.h>
 
-// ── PIN ESP32 ─────────────────────────────────────
-#define PIN_RFID_SS    5
-#define PIN_RFID_RST   27
-#define PIN_SERVO      13
-#define PIN_TRIG       26
-#define PIN_ECHO       25
-#define PIN_BUZZER     12
-#define PIN_LED_HIJAU  14
-#define PIN_LED_MERAH  32
-#define PIN_BUTTON     4
-#define PIN_LED_KUNING 33
-#define PIN_LDR        34
-#define PIN_LED_LAMPU  15
-
-// ── SERVO via LEDC (tanpa library Servo) ─────────
-#define SERVO_LEDC_FREQ 50
-#define SERVO_LEDC_BIT  16
-
-// ── SERVO via LEDC (Core v3 API) ─────────────────
-void servoAttach() {
-  ledcAttach(PIN_SERVO, SERVO_LEDC_FREQ, SERVO_LEDC_BIT);
-}
-
-void servoWrite(int angle) {
-  uint32_t duty = map(angle, 0, 180, 1638, 8192);
-  ledcWrite(PIN_SERVO, duty);
-}
-// ── OLED SSD1306 128x64 I2C ───────────────────────
-#define OLED_WIDTH  128
-#define OLED_HEIGHT 64
-#define OLED_ADDR   0x3C
-#define PIN_SDA     21
-#define PIN_SCL     22
-
-// ── KONFIGURASI ──────────────────────────────────
-#define KAPASITAS_SLOT  3
-#define JARAK_BATAS     120
-#define JARAK_DEKAT     3
-#define JEDA_TUTUP      5000
-#define AMBANG_GELAP    1800
+// DEFINE PIN
+#define RFID_SS_PIN     5
+#define RFID_RST_PIN    27
+#define RFID_SCK_PIN    18
+#define RFID_MISO_PIN   19
+#define RFID_MOSI_PIN   23
+#define SERVO_PIN       13
+#define SERVO_TUTUP     10
 #define SERVO_BUKA      90
-#define SERVO_TUTUP     0
+#define BUZZER_PIN      14
+#define TRIG_PIN        32
+#define ECHO_PIN        33
+#define LDR_DO_PIN      4
+// #define LDR_AO_PIN     34  // ADC1_CH6 — uncomment jika pakai AO
 
-// ── UID KARTU RFID TERDAFTAR ─────────────────────
-const byte UID_TERDAFTAR[][4] = {
-  {0x01, 0x02, 0x03, 0x04},
-  {0x11, 0x22, 0x33, 0x44},
-  {0x55, 0x66, 0x77, 0x88}
-};
-const int JUMLAH_KARTU = 3;
+// VARIABLE
+#define JARAK_DETEKSI       20
+#define AMBANG_LEWAT        8
+#define MIN_JARAK           2
+#define MAX_JARAK           200
+#define JUMLAH_SAMPEL       5
+#define DEBOUNCE            3
+#define INTERVAL_US         500
+#define INTERVAL_LDR        500
+#define INTERVAL_RFID       1000
 
-// ── TIPE EVENT UNTUK QUEUE ───────────────────────
-typedef enum {
-  EVT_KARTU_VALID,
-  EVT_KARTU_INVALID,
-  EVT_SLOT_PENUH,
-  EVT_PALANG_TUTUP,
-  EVT_RESET_DARURAT
-} EventType;
+// OBJEK
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+MFRC522           rfid(RFID_SS_PIN, RFID_RST_PIN);
+Servo             servoPalang;
 
-// ── OBJEK ────────────────────────────────────────
-MFRC522 rfid(PIN_RFID_SS, PIN_RFID_RST);
-Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+// UID KARTU YANG DIIZINKAN
+byte authorizedUID[4] = { 0x52, 0x89, 0x16, 0x05 };
 
-// ── SHARED DATA ───────────────────────────────────
-int           slotTerisi          = 0;
-bool          palangTerbuka       = false;
-bool          kendaraanTerdeteksi = false;
-bool          lampuMenyala        = false;
-float         jarakTerakhir       = 999.0;
-String        pesanOLED1          = "Sistem Parkir";
-String        pesanOLED2          = "Siap Beroperasi";
-String        pesanOLED3          = "";
-bool          modeScan            = false;
+// SEMAPHORE
+SemaphoreHandle_t echoSem;
+SemaphoreHandle_t lcdMutex;
 
-// ── RTOS HANDLES ─────────────────────────────────
-SemaphoreHandle_t xMutex_SharedData;
-SemaphoreHandle_t xSemaphore_RFID;
-QueueHandle_t     xQueue_Event;
+// ISR ULTRASONIC
+volatile unsigned long echoMulai  = 0;
+volatile unsigned long durasiEcho = 0;
 
-// ── ISR BUTTON ───────────────────────────────────
-volatile bool resetDarurat = false;
-void IRAM_ATTR ISR_ResetDarurat() {
-  resetDarurat = true;
+void IRAM_ATTR isrEcho()
+{
+  if (digitalRead(ECHO_PIN) == HIGH)
+  {
+    echoMulai = micros();
+  }
+  else
+  {
+    if (echoMulai > 0)
+    {
+      durasiEcho = micros() - echoMulai;
+      BaseType_t wake = pdFALSE;
+      xSemaphoreGiveFromISR(echoSem, &wake);
+      portYIELD_FROM_ISR(wake);
+    }
+  }
 }
 
-// ══════════════════════════════════════════════════
-// HELPER
-// ══════════════════════════════════════════════════
-float ukurJarak() {
-  digitalWrite(PIN_TRIG, LOW);
-  delayMicroseconds(2);
-  digitalWrite(PIN_TRIG, HIGH);
+// STATE GLOBAL
+volatile bool mobilDetect = false;
+volatile bool palangSibuk = false;
+volatile bool rfidGranted = false;
+volatile int  jarakLast   = -1;
+
+enum GateState { CLOSED, CAR_DETECT, ACCESS, PASSING, COUNTDOWN };
+GateState gateState = CLOSED;
+
+// TASK HANDLE
+TaskHandle_t hUltrasonik;
+TaskHandle_t hRFID;
+TaskHandle_t hLDR;
+
+// HELPER: LCD dengan mutex
+void lcdPrint(const char* line0, const char* line1)
+{
+  xSemaphoreTake(lcdMutex, portMAX_DELAY);
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(line0);
+  lcd.setCursor(0, 1); lcd.print(line1);
+  xSemaphoreGive(lcdMutex);
+}
+
+// HELPER: LCD standby
+void lcdSiap()
+{
+  xSemaphoreTake(lcdMutex, portMAX_DELAY);
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("SMART PARKING");
+  lcd.setCursor(0, 1); lcd.print("SIAP...");
+  xSemaphoreGive(lcdMutex);
+}
+
+// HELPER: cocokkan UID
+bool uidMatch(MFRC522::Uid *uid)
+{
+  if (uid->size != 4) return false;
+  for (int i = 0; i < 4; i++)
+    if (uid->uidByte[i] != authorizedUID[i]) return false;
+  return true;
+}
+
+// HELPER: baca jarak 1x via binary semaphore
+int bacaJarak()
+{
+  xSemaphoreTake(echoSem, 0);
+
+  echoMulai  = 0;
+  durasiEcho = 0;
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(4);
+  digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
-  digitalWrite(PIN_TRIG, LOW);
-  long durasi = pulseIn(PIN_ECHO, HIGH, 30000);
-  return (durasi * 0.0343) / 2.0;
-}
+  digitalWrite(TRIG_PIN, LOW);
 
-bool cekKartuTerdaftar(byte* uid, byte ukuranUID) {
-  if (ukuranUID != 4) return false;
-  for (int i = 0; i < JUMLAH_KARTU; i++) {
-    if (memcmp(uid, UID_TERDAFTAR[i], 4) == 0) return true;
+  if (xSemaphoreTake(echoSem, pdMS_TO_TICKS(35)) == pdTRUE)
+  {
+    int d = (int)(durasiEcho * 0.034f / 2.0f);
+    if (d < MIN_JARAK || d > MAX_JARAK) return -1;
+    return d;
   }
-  return false;
+
+  return -1;
 }
 
-void setStatusOLED(String b1, String b2, String b3 = "") {
-  if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(50)) == pdTRUE) {
-    pesanOLED1 = b1;
-    pesanOLED2 = b2;
-    pesanOLED3 = b3;
-    xSemaphoreGive(xMutex_SharedData);
+// HELPER: median filter
+int compareInt(const void *a, const void *b)
+{
+  return (*(int *)a - *(int *)b);
+}
+
+int bacaJarakMedian()
+{
+  int buf[JUMLAH_SAMPEL];
+  int n = 0;
+  for (int i = 0; i < JUMLAH_SAMPEL; i++)
+  {
+    int d = bacaJarak();
+    if (d != -1) buf[n++] = d;
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
+  if (n == 0) return -1;
+  qsort(buf, n, sizeof(int), compareInt);
+  return buf[n / 2];
 }
 
-// ══════════════════════════════════════════════════
-// TASK 1: ULTRASONIC
-// ══════════════════════════════════════════════════
-void TaskUltrasonic(void* pvParameters) {
-  for (;;) {
-    float jarak = ukurJarak();
+// TASK: ULTRASONIC + STATE MACHINE GATE — Core 0, prioritas 2
+void taskUltrasonic(void *pv)
+{
+  int  stableNear = 0;
+  int  stableFar  = 0;
+  unsigned long tPrint = 0;
+  unsigned long closeAt = 0;
 
-    if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(10)) == pdTRUE) {
-      jarakTerakhir = jarak;
+  while (true)
+  {
+    int  d     = bacaJarakMedian();
+    bool dekat = (d != -1 && d <= JARAK_DETEKSI);
 
-      if (!palangTerbuka) {
-        bool terdeteksi = (jarak < JARAK_BATAS && jarak > 0);
-        if (terdeteksi && !kendaraanTerdeteksi) {
-          kendaraanTerdeteksi = true;
-          modeScan = true;
-          digitalWrite(PIN_LED_KUNING, HIGH);
-          digitalWrite(PIN_LED_HIJAU, LOW);
-          digitalWrite(PIN_LED_MERAH, LOW);
-          xSemaphoreGive(xMutex_SharedData);
-          setStatusOLED("  Selamat", "  Datang!", "Scan kartu RFID");
-          xSemaphoreGive(xSemaphore_RFID);
-          continue;
-        } else if (!terdeteksi && kendaraanTerdeteksi) {
-          kendaraanTerdeteksi = false;
-          modeScan = false;
-          digitalWrite(PIN_LED_KUNING, LOW);
+    jarakLast = d;
+
+    if (dekat) { stableNear++; stableFar  = 0; }
+    else        { stableFar++;  stableNear = 0; }
+
+    // Serial print periodik
+    if (millis() - tPrint >= INTERVAL_US)
+    {
+      tPrint = millis();
+      if (d == -1)
+        Serial.println("[Ultrasonik]   Jarak: --  cm | Status: TIMEOUT");
+      else if (dekat)
+        Serial.printf("[Ultrasonik]   Jarak: %3d cm | Status: ADA MOBIL <<<\n", d);
+      else
+        Serial.printf("[Ultrasonik]   Jarak: %3d cm | Status: KOSONG\n", d);
+    }
+
+    // STATE MACHINE GATE
+    switch (gateState)
+    {
+      case CLOSED:
+        if (stableNear >= DEBOUNCE)
+        {
+          mobilDetect = true;
+          gateState = CAR_DETECT;
+          lcdPrint("ADA MOBIL", "SCAN RFID");
+          Serial.println("[GATE] CLOSED → CAR_DETECT");
         }
-      }
-      xSemaphoreGive(xMutex_SharedData);
-    }
-    vTaskDelay(pdMS_TO_TICKS(150));
-  }
-}
+        break;
 
-// ══════════════════════════════════════════════════
-// TASK 2: RFID
-// ══════════════════════════════════════════════════
-void TaskRFID(void* pvParameters) {
-  for (;;) {
-    xSemaphoreTake(xSemaphore_RFID, portMAX_DELAY);
-    Serial.println("[RFID] Mode aktif, menunggu kartu...");
-
-    bool masihAda = true;
-    while (masihAda) {
-      if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(10)) == pdTRUE) {
-        masihAda = kendaraanTerdeteksi && !palangTerbuka;
-        xSemaphoreGive(xMutex_SharedData);
-      }
-      if (!masihAda) break;
-
-      if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        continue;
-      }
-
-      Serial.print("[RFID] UID: ");
-      for (byte i = 0; i < rfid.uid.size; i++) Serial.printf("%02X ", rfid.uid.uidByte[i]);
-      Serial.println();
-
-      EventType evt;
-      bool slotPenuh = false, valid = false;
-
-      if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(50)) == pdTRUE) {
-        slotPenuh = (slotTerisi >= KAPASITAS_SLOT);
-        valid = cekKartuTerdaftar(rfid.uid.uidByte, rfid.uid.size);
-        xSemaphoreGive(xMutex_SharedData);
-      }
-
-      if (slotPenuh) {
-        evt = EVT_SLOT_PENUH;
-        setStatusOLED("  SLOT PENUH!", " Maaf, coba", "   lagi nanti");
-      } else if (valid) {
-        evt = EVT_KARTU_VALID;
-        setStatusOLED("Akses Diterima", "Palang Terbuka", "Selamat masuk!");
-        if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(100)) == pdTRUE) {
-          servoWrite(SERVO_BUKA);
-          palangTerbuka = true;
-          kendaraanTerdeteksi = false;
-          modeScan = false;
-          digitalWrite(PIN_LED_KUNING, LOW);
-          digitalWrite(PIN_LED_HIJAU, HIGH);
-          xSemaphoreGive(xMutex_SharedData);
+      case CAR_DETECT:
+        if (rfidGranted)
+        {
+          rfidGranted = false;
+          palangSibuk = true;
+          gateState = ACCESS;
         }
-      } else {
-        evt = EVT_KARTU_INVALID;
-        setStatusOLED("Kartu Invalid!", "Akses Ditolak", "Coba lagi...");
-      }
-
-      xQueueSend(xQueue_Event, &evt, pdMS_TO_TICKS(50));
-      rfid.PICC_HaltA();
-      rfid.PCD_StopCrypto1();
-
-      if (evt == EVT_KARTU_VALID) break;
-      vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-  }
-}
-
-// ══════════════════════════════════════════════════
-// TASK 3: PALANG
-// ══════════════════════════════════════════════════
-void TaskPalang(void* pvParameters) {
-  for (;;) {
-    bool buka = false;
-    if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(10)) == pdTRUE) {
-      buka = palangTerbuka;
-      xSemaphoreGive(xMutex_SharedData);
-    }
-
-    if (buka) {
-      float jarak = 0;
-      if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(10)) == pdTRUE) {
-        jarak = jarakTerakhir;
-        xSemaphoreGive(xMutex_SharedData);
-      }
-
-      if (jarak <= JARAK_DEKAT && jarak > 0) {
-        Serial.println("[PALANG] Hitung mundur 5 detik...");
-        for (int i = 5; i >= 0; i--) {
-          setStatusOLED("Kendaraan Lewat", "Menutup dalam:", String(i) + " detik...");
-          vTaskDelay(pdMS_TO_TICKS(1000));
+        else if (stableFar >= DEBOUNCE && !palangSibuk)
+        {
+          mobilDetect = false;
+          gateState = CLOSED;
+          lcdSiap();
+          Serial.println("[GATE] CAR_DETECT → CLOSED (mobil pergi)");
         }
-        if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(100)) == pdTRUE) {
-          servoWrite(SERVO_TUTUP);
-          palangTerbuka = false;
-          slotTerisi++;
-          int kosong = KAPASITAS_SLOT - slotTerisi;
-          digitalWrite(PIN_LED_HIJAU, kosong > 0 ? HIGH : LOW);
-          digitalWrite(PIN_LED_MERAH, kosong <= 0 ? HIGH : LOW);
-          String b2 = (kosong > 0) ? "Kosong: " + String(kosong) : "  PARKIR PENUH!";
-          xSemaphoreGive(xMutex_SharedData);
-          setStatusOLED("Slot: " + String(slotTerisi) + "/" + String(KAPASITAS_SLOT), b2, "");
+        break;
+
+      case ACCESS:
+        Serial.println("[GATE] CAR_DETECT → ACCESS — BUKA PALANG");
+        lcdPrint("AKSES DITERIMA", "PALANG BUKA");
+        digitalWrite(BUZZER_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        digitalWrite(BUZZER_PIN, LOW);
+        servoPalang.write(SERVO_BUKA);
+        Serial.println("[SERVO] Posisi: BUKA 90°");
+        gateState = PASSING;
+        break;
+
+      case PASSING:
+        if (d != -1 && d <= AMBANG_LEWAT)
+        {
+          closeAt = millis() + 5000;
+          gateState = COUNTDOWN;
+          lcdPrint("MENUTUP PALANG", "TUTUP 5 dtk");
+          Serial.println("[GATE] PASSING → COUNTDOWN (5dtk)");
         }
-        EventType evt = EVT_PALANG_TUTUP;
-        xQueueSend(xQueue_Event, &evt, pdMS_TO_TICKS(50));
-      }
-    }
+        break;
 
-    // Cek reset darurat
-    if (resetDarurat) {
-      resetDarurat = false;
-      EventType evt = EVT_RESET_DARURAT;
-      xQueueSend(xQueue_Event, &evt, pdMS_TO_TICKS(50));
-      if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(100)) == pdTRUE) {
-        servoWrite(SERVO_TUTUP);
-        palangTerbuka = false;
-        kendaraanTerdeteksi = false;
-        slotTerisi = 0;
-        modeScan = false;
-        lampuMenyala = false;
-        digitalWrite(PIN_LED_KUNING, LOW);
-        digitalWrite(PIN_LED_HIJAU, HIGH);
-        digitalWrite(PIN_LED_MERAH, LOW);
-        digitalWrite(PIN_LED_LAMPU, LOW);
-        xSemaphoreGive(xMutex_SharedData);
-      }
-      setStatusOLED("!! RESET !!", "Sistem direset", "Slot: 0/" + String(KAPASITAS_SLOT));
-    }
+      case COUNTDOWN:
+      {
+        int sisa = (closeAt - millis()) / 1000 + 1;
+        if (sisa < 0) sisa = 0;
 
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-}
-
-// ══════════════════════════════════════════════════
-// TASK 4: BUZZER + LED
-// ══════════════════════════════════════════════════
-void TaskBuzzerLED(void* pvParameters) {
-  EventType evt;
-  for (;;) {
-    if (xQueueReceive(xQueue_Event, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
-      switch (evt) {
-        case EVT_KARTU_VALID:
-          for (int i = 0; i < 3; i++) {
-            digitalWrite(PIN_LED_HIJAU, HIGH); digitalWrite(PIN_BUZZER, HIGH);
-            vTaskDelay(pdMS_TO_TICKS(200));
-            digitalWrite(PIN_LED_HIJAU, LOW);  digitalWrite(PIN_BUZZER, LOW);
-            vTaskDelay(pdMS_TO_TICKS(100));
-          }
-          digitalWrite(PIN_LED_HIJAU, HIGH);
-          break;
-        case EVT_KARTU_INVALID:
-          for (int i = 0; i < 5; i++) {
-            digitalWrite(PIN_LED_MERAH, HIGH); digitalWrite(PIN_BUZZER, HIGH);
-            vTaskDelay(pdMS_TO_TICKS(80));
-            digitalWrite(PIN_LED_MERAH, LOW);  digitalWrite(PIN_BUZZER, LOW);
-            vTaskDelay(pdMS_TO_TICKS(80));
-          }
-          vTaskDelay(pdMS_TO_TICKS(1500));
-          if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(10)) == pdTRUE) {
-            if (kendaraanTerdeteksi) digitalWrite(PIN_LED_KUNING, HIGH);
-            xSemaphoreGive(xMutex_SharedData);
-          }
-          break;
-        case EVT_SLOT_PENUH:
-          for (int i = 0; i < 3; i++) {
-            digitalWrite(PIN_LED_MERAH, HIGH); digitalWrite(PIN_BUZZER, HIGH);
-            vTaskDelay(pdMS_TO_TICKS(150));
-            digitalWrite(PIN_LED_MERAH, LOW);  digitalWrite(PIN_BUZZER, LOW);
-            vTaskDelay(pdMS_TO_TICKS(150));
-          }
-          break;
-        case EVT_PALANG_TUTUP:
-          for (int i = 0; i < 2; i++) {
-            digitalWrite(PIN_BUZZER, HIGH); vTaskDelay(pdMS_TO_TICKS(150));
-            digitalWrite(PIN_BUZZER, LOW);  vTaskDelay(pdMS_TO_TICKS(150));
-          }
-          break;
-        case EVT_RESET_DARURAT:
-          for (int i = 0; i < 5; i++) {
-            digitalWrite(PIN_BUZZER, HIGH); digitalWrite(PIN_LED_MERAH, HIGH);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            digitalWrite(PIN_BUZZER, LOW);  digitalWrite(PIN_LED_MERAH, LOW);
-            vTaskDelay(pdMS_TO_TICKS(100));
-          }
-          break;
-      }
-    }
-  }
-}
-
-// ══════════════════════════════════════════════════
-// TASK 5: DISPLAY OLED
-// ══════════════════════════════════════════════════
-void TaskDisplay(void* pvParameters) {
-  for (;;) {
-    String b1, b2, b3;
-    int slot;
-    float jarak;
-    bool lampu;
-
-    if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(30)) == pdTRUE) {
-      b1    = pesanOLED1; b2 = pesanOLED2; b3 = pesanOLED3;
-      slot  = slotTerisi;
-      jarak = jarakTerakhir;
-      lampu = lampuMenyala;
-      xSemaphoreGive(xMutex_SharedData);
-    }
-
-    oled.clearDisplay();
-    oled.fillRect(0, 0, 128, 12, WHITE);
-    oled.setTextColor(BLACK); oled.setTextSize(1);
-    oled.setCursor(2, 2);   oled.print("PARKIR UNSOED");
-    oled.setCursor(90, 2);  oled.print(String(slot) + "/" + String(KAPASITAS_SLOT));
-
-    oled.setTextColor(WHITE);
-    oled.setCursor(0, 16); oled.print(b1);
-    oled.setCursor(0, 28); oled.print(b2);
-    oled.setCursor(0, 40); oled.print(b3);
-
-    oled.drawLine(0, 52, 128, 52, WHITE);
-    oled.setCursor(0, 55); oled.print("Jrk:");
-    if (jarak <= 0 || jarak > 400) oled.print("--");
-    else oled.print(String((int)jarak));
-    oled.print("cm ");
-    oled.print(lampu ? "LAMP:ON" : "LAMP:OFF");
-
-    oled.display();
-    vTaskDelay(pdMS_TO_TICKS(200));
-  }
-}
-
-// ══════════════════════════════════════════════════
-// TASK 6: LDR
-// ══════════════════════════════════════════════════
-void TaskLDR(void* pvParameters) {
-  for (;;) {
-    int cahaya = analogRead(PIN_LDR);
-    if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(20)) == pdTRUE) {
-      if (cahaya < AMBANG_GELAP && !lampuMenyala) {
-        lampuMenyala = true;
-        digitalWrite(PIN_LED_LAMPU, HIGH);
-      } else if (cahaya >= AMBANG_GELAP && lampuMenyala) {
-        lampuMenyala = false;
-        digitalWrite(PIN_LED_LAMPU, LOW);
-      }
-      xSemaphoreGive(xMutex_SharedData);
-    }
-    vTaskDelay(pdMS_TO_TICKS(2000));
-  }
-}
-
-// ══════════════════════════════════════════════════
-// TASK 7: INDIKATOR SLOT (LED HIJAU/MERAH)
-// ══════════════════════════════════════════════════
-void TaskSlotIndicator(void* pvParameters) {
-  for (;;) {
-    int slot;
-    if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(20)) == pdTRUE) {
-      slot = slotTerisi;
-      if (slot < KAPASITAS_SLOT) {
-        digitalWrite(PIN_LED_HIJAU, HIGH);
-        digitalWrite(PIN_LED_MERAH, LOW);
-      } else {
-        digitalWrite(PIN_LED_HIJAU, LOW);
-        digitalWrite(PIN_LED_MERAH, HIGH);
-      }
-      xSemaphoreGive(xMutex_SharedData);
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
-  }
-}
-
-// ══════════════════════════════════════════════════
-// TASK 8: SERIAL MONITOR INTERAKTIF
-// ══════════════════════════════════════════════════
-void TaskSerial(void* pvParameters) {
-  vTaskDelay(pdMS_TO_TICKS(2000)); // tunggu sistem ready
-
-  Serial.println("╔══════════════════════════════════════╗");
-  Serial.println("║   SISTEM PARKIR UNSOED - FreeRTOS    ║");
-  Serial.println("╠══════════════════════════════════════╣");
-  Serial.println("║ Perintah:                            ║");
-  Serial.println("║  'status' → lihat status parkir      ║");
-  Serial.println("║  'uid'    → cara daftarin kartu      ║");
-  Serial.println("║  'reset'  → reset sistem             ║");
-  Serial.println("║  'help'   → tampilkan menu ini       ║");
-  Serial.println("╚══════════════════════════════════════╝");
-
-  String inputBuffer = "";
-
-  for (;;) {
-    // ── Print status otomatis tiap 5 detik ──
-    static unsigned long lastPrint = 0;
-    if (millis() - lastPrint >= 5000) {
-      lastPrint = millis();
-
-      int slot, kapasitas = KAPASITAS_SLOT;
-      bool palang, lampu;
-      float jarak;
-
-      if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(20)) == pdTRUE) {
-        slot   = slotTerisi;
-        palang = palangTerbuka;
-        lampu  = lampuMenyala;
-        jarak  = jarakTerakhir;
-        xSemaphoreGive(xMutex_SharedData);
-      }
-
-      Serial.println("──────────────────────────────────────");
-      Serial.print  ("  Slot terisi : "); Serial.print(slot); Serial.print("/"); Serial.println(kapasitas);
-      Serial.print  ("  Slot kosong : "); Serial.println(kapasitas - slot);
-      Serial.print  ("  Palang      : "); Serial.println(palang ? "TERBUKA" : "TERTUTUP");
-      Serial.print  ("  Jarak       : "); Serial.print((int)jarak); Serial.println(" cm");
-      Serial.print  ("  Lampu       : "); Serial.println(lampu ? "MENYALA" : "MATI");
-      Serial.println("──────────────────────────────────────");
-    }
-
-    // ── Baca input dari Serial ──
-    while (Serial.available()) {
-      char c = (char)Serial.read();
-      if (c == '\n' || c == '\r') {
-        inputBuffer.trim();
-        if (inputBuffer.length() > 0) {
-          Serial.print("> "); Serial.println(inputBuffer);
-
-          if (inputBuffer == "status") {
-            int slot;
-            bool palang, lampu;
-            float jarak;
-            if (xSemaphoreTake(xMutex_SharedData, pdMS_TO_TICKS(20)) == pdTRUE) {
-              slot   = slotTerisi;
-              palang = palangTerbuka;
-              lampu  = lampuMenyala;
-              jarak  = jarakTerakhir;
-              xSemaphoreGive(xMutex_SharedData);
-            }
-            Serial.println("═══════ STATUS PARKIR ═══════");
-            Serial.print("  Slot   : "); Serial.print(slot); Serial.print("/"); Serial.println(KAPASITAS_SLOT);
-            Serial.print("  Kosong : "); Serial.println(KAPASITAS_SLOT - slot);
-            Serial.print("  Palang : "); Serial.println(palang ? "TERBUKA ✓" : "TERTUTUP");
-            Serial.print("  Jarak  : "); Serial.print((int)jarak); Serial.println(" cm");
-            Serial.print("  Lampu  : "); Serial.println(lampu ? "ON 💡" : "OFF");
-            Serial.println("═════════════════════════════");
-
-          } else if (inputBuffer == "uid") {
-            Serial.println("═══════ CARA DAFTARIN KARTU ═══════");
-            Serial.println("  1. Klik komponen RFID di Wokwi");
-            Serial.println("  2. Di panel kanan isi UID (contoh: DE AD BE EF)");
-            Serial.println("  3. Klik 'Scan Card'");
-            Serial.println("  4. Lihat UID yang muncul di sini:");
-            Serial.println("     [RFID] UID: XX XX XX XX");
-            Serial.println("  5. Salin ke kode:");
-            Serial.println("     const byte UID_TERDAFTAR[][4] = {");
-            Serial.println("       {0xXX, 0xXX, 0xXX, 0xXX},");
-            Serial.println("     };");
-            Serial.println("════════════════════════════════════");
-
-          } else if (inputBuffer == "reset") {
-            Serial.println("[SERIAL] Reset manual via Serial Monitor...");
-            resetDarurat = true;
-
-          } else if (inputBuffer == "help") {
-            Serial.println("╔══════════════════════════════════════╗");
-            Serial.println("║ Perintah:                            ║");
-            Serial.println("║  'status' → lihat status parkir      ║");
-            Serial.println("║  'uid'    → cara daftarin kartu      ║");
-            Serial.println("║  'reset'  → reset sistem             ║");
-            Serial.println("║  'help'   → tampilkan menu ini       ║");
-            Serial.println("╚══════════════════════════════════════╝");
-
-          } else {
-            Serial.print("[!] Perintah tidak dikenal: ");
-            Serial.println(inputBuffer);
-            Serial.println("    Ketik 'help' untuk daftar perintah.");
-          }
+        if (sisa == 0)
+        {
+          servoPalang.write(SERVO_TUTUP);
+          Serial.println("[SERVO] Posisi: TUTUP 10°");
+          lcdSiap();
+          palangSibuk = false;
+          mobilDetect = false;
+          gateState = CLOSED;
+          Serial.println("[GATE] COUNTDOWN → CLOSED");
         }
-        inputBuffer = "";
-      } else {
-        inputBuffer += c;
+        else
+        {
+          xSemaphoreTake(lcdMutex, portMAX_DELAY);
+          lcd.clear();
+          lcd.setCursor(0, 0); lcd.print("MENUTUP PALANG");
+          lcd.setCursor(0, 1); lcd.print("TUTUP ");
+          lcd.print(sisa);
+          lcd.print(" dtk");
+          xSemaphoreGive(lcdMutex);
+        }
+        break;
       }
     }
 
@@ -548,62 +267,172 @@ void TaskSerial(void* pvParameters) {
   }
 }
 
-// ══════════════════════════════════════════════════
-// SETUP
-// ══════════════════════════════════════════════════
-void setup() {
-  Serial.begin(115200);
-
-  pinMode(PIN_TRIG,       OUTPUT);
-  pinMode(PIN_ECHO,       INPUT);
-  pinMode(PIN_BUZZER,     OUTPUT);
-  pinMode(PIN_LED_HIJAU,  OUTPUT);
-  pinMode(PIN_LED_MERAH,  OUTPUT);
-  pinMode(PIN_LED_KUNING, OUTPUT);
-  pinMode(PIN_LED_LAMPU,  OUTPUT);
-  pinMode(PIN_BUTTON,     INPUT_PULLUP);
-
-  digitalWrite(PIN_LED_HIJAU,  LOW);
-  digitalWrite(PIN_LED_MERAH,  LOW);
-  digitalWrite(PIN_LED_KUNING, LOW);
-  digitalWrite(PIN_LED_LAMPU,  LOW);
-
-  attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), ISR_ResetDarurat, FALLING);
-
-  SPI.begin(18, 19, 23, PIN_RFID_SS);
+// TASK: RFID — Core 1, prioritas 2
+void taskRFID(void *pv)
+{
+  SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, RFID_SS_PIN);
   rfid.PCD_Init();
+  delay(50);
 
-  servoAttach();
-  servoWrite(SERVO_TUTUP);
+  byte ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  Serial.printf("[RFID] Firmware: 0x%02X %s\n", ver,
+    (ver == 0x91 || ver == 0x92) ? "OK" : "!!! CEK WIRING SPI !!!");
 
-  Wire.begin(PIN_SDA, PIN_SCL);
-  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("OLED gagal!");
-  } else {
-    oled.clearDisplay();
-    oled.setTextColor(WHITE);
-    oled.setTextSize(1);
-    oled.setCursor(10, 20); oled.print("PARKIR UNSOED");
-    oled.setCursor(15, 35); oled.print("FreeRTOS Ready");
-    oled.display();
+  unsigned long tPrint = 0;
+
+  while (true)
+  {
+    if (millis() - tPrint >= INTERVAL_RFID)
+    {
+      tPrint = millis();
+      if (palangSibuk)
+        Serial.println("[RFID] Status: GATE SIBUK (palang bergerak)");
+      else if (!mobilDetect)
+        Serial.println("[RFID] Status: TIDAK AKTIF (tunggu deteksi mobil)");
+      else
+        Serial.println("[RFID] Status: AKTIF — menunggu scan kartu...");
+    }
+
+    if (!mobilDetect || palangSibuk)
+    {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    if (!rfid.PICC_IsNewCardPresent())
+    {
+      vTaskDelay(pdMS_TO_TICKS(150));
+      continue;
+    }
+
+    if (!rfid.PICC_ReadCardSerial())
+    {
+      vTaskDelay(pdMS_TO_TICKS(150));
+      continue;
+    }
+
+    Serial.print("[RFID] Kartu terdeteksi — UID: ");
+    for (byte i = 0; i < rfid.uid.size; i++)
+      Serial.printf("%02X ", rfid.uid.uidByte[i]);
+    Serial.println();
+
+    if (uidMatch(&rfid.uid))
+    {
+      rfidGranted = true;
+      Serial.println("[RFID] >> AKSES DITERIMA");
+    }
+    else
+    {
+      Serial.println("[RFID] >> AKSES DITOLAK — kartu tidak dikenal");
+
+      xSemaphoreTake(lcdMutex, portMAX_DELAY);
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("AKSES DITOLAK");
+      lcd.setCursor(0, 1); lcd.print("KARTU INVALID");
+      xSemaphoreGive(lcdMutex);
+
+      for (int i = 0; i < 3; i++)
+      {
+        digitalWrite(BUZZER_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        digitalWrite(BUZZER_PIN, LOW);
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+
+      lcdPrint("COBA LAGI", "SCAN RFID");
+      Serial.println("[RFID] Menunggu scan ulang...");
+    }
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
-
-  xMutex_SharedData = xSemaphoreCreateMutex();
-  xSemaphore_RFID   = xSemaphoreCreateBinary();
-  xQueue_Event      = xQueueCreate(10, sizeof(EventType));
-
-  xTaskCreatePinnedToCore(TaskRFID,       "RFID",       4096, NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(TaskUltrasonic, "Ultrasonic", 2048, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(TaskPalang,     "Palang",     2048, NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(TaskBuzzerLED,  "BuzzerLED",  2048, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(TaskDisplay,    "Display",    4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(TaskLDR,        "LDR",        1024, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(TaskSlotIndicator, "SlotInd", 1024, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(TaskSerial, "Serial", 3072, NULL, 1, NULL, 0);
-
-  Serial.println("=== SISTEM PARKIR ESP32 + FreeRTOS AKTIF ===");
 }
 
-void loop() {
+// TASK: LDR — Core 0, prioritas 1
+void taskLDR(void *pv)
+{
+  unsigned long tPrint = 0;
+
+  while (true)
+  {
+    int state = digitalRead(LDR_DO_PIN);
+    // int analog = analogRead(LDR_AO_PIN);  // uncomment jika pakai AO
+
+    if (millis() - tPrint >= INTERVAL_LDR)
+    {
+      tPrint = millis();
+      Serial.printf("[LDR]  DO: %-4s | Cahaya: %-6s\n",
+        state ? "HIGH" : "LOW",
+        state ? "GELAP" : "TERANG");
+      // Serial.printf("[LDR]  DO: %-4s | AO: %4d\n",
+      //   state ? "HIGH" : "LOW", analog);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// SETUP
+void setup()
+{
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("\n============================================");
+  Serial.println("       SMART PARKING — ESP32 FreeRTOS      ");
+  Serial.println("============================================");
+
+  echoSem   = xSemaphoreCreateBinary();
+  lcdMutex  = xSemaphoreCreateMutex();
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(LDR_DO_PIN, INPUT);
+  // analogReadResolution(12);           // default 12-bit (0-4095)
+  // pinMode(LDR_AO_PIN, INPUT);         // uncomment jika pakai AO
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcdSiap();
+
+  servoPalang.attach(SERVO_PIN);
+  servoPalang.write(SERVO_TUTUP);
+  Serial.println("[SERVO] Init TUTUP 10°");
+  delay(500);
+
+  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), isrEcho, CHANGE);
+  Serial.println("[ISR]  ECHO terpasang (GPIO " + String(ECHO_PIN) + ")");
+
+  // TASK FreeRTOS
+  xTaskCreatePinnedToCore(
+    taskUltrasonic, "Ultrasonic",
+    4096, NULL, 2, &hUltrasonik, 0);
+  Serial.println("[RTOS] Task Ultrasonic → Core 0, prioritas 2");
+
+  xTaskCreatePinnedToCore(
+    taskRFID, "RFID",
+    4096, NULL, 2, &hRFID, 1);
+  Serial.println("[RTOS] Task RFID → Core 1, prioritas 2");
+
+  xTaskCreatePinnedToCore(
+    taskLDR, "LDR",
+    2048, NULL, 1, &hLDR, 0);
+  Serial.println("[RTOS] Task LDR → Core 0, prioritas 1");
+
+  Serial.println("--------------------------------------------");
+  Serial.println("  Sistem berjalan.");
+  Serial.println("============================================\n");
+}
+
+void loop()
+{
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
