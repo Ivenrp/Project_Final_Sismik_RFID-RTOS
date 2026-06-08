@@ -3,8 +3,8 @@
 
 # Automatically added based on includes:
 Servo
-Adafruit GFX Library
+LiquidCrystal I2C
 
 MFRC522
-Adafruit SSD1306
-Adafruit GFX Library
+Easy MFRC522
+ESP32Servo
