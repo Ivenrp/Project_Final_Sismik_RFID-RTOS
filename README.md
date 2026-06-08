@@ -3,12 +3,11 @@
 ---
 
 ## Anggota:
-- Iven RivaL Pangestu (H1H024013)   - [Github](https://github.com/Ivenrp)
+- Iven RivaL Pangestu (H1H024013) - [Github](https://github.com/Ivenrp)
 - Apriyudha (H1H024010) - [Github](https://github.com/avriyyy)
-- Mohammad Zulfan Ramadhan (H1H024008) - [Github](https://github.com/mzulfanr13-code) 
+- Mohammad Zulfan Ramadhan (H1H024008) - [Github](https://github.com/mzulfanr13-code)
 - Maharani Tri Wahyuningrum (H1H024012)
-- Febrian Theopilus Purba	(H1H0240)
-
+- Febrian Theopilus Purba (H1H0240)
 
 ---
 
@@ -17,40 +16,30 @@ Sistem palang parkir otomatis berbasis ESP32 dengan FreeRTOS. Mendeteksi kendara
 ## Flowchart
 
 ```mermaid
-stateDiagram-v2
-    [*] --> CLOSED
+flowchart TD
+    START([Mulai]) --> STAND
 
-    CLOSED --> CAR_DETECT : jarak ≤ 20cm (debounce 3x)
+    STAND -->|"Jarak ≤20cm ×3"| CAR["Mobil Terdeteksi\nLCD: ADA MOBIL / SCAN RFID"]
+    CAR -->|"RFID cocok"| ACC["AKSES DITERIMA\nBuzzer 1×\nPalang BUKA 90°"]
+    CAR -->|"Mobil pergi\njarak >20cm ×3"| STAND
+    ACC --> WAIT["Tunggu 5 detik"]
+    WAIT --> CLOSE["MENUTUP PALANG\nPalang TUTUP 10°"]
+    CLOSE -->|"Tunggu 1,5 dtk"| STAND
 
-    CAR_DETECT --> ACCESS  : RFID cocok
-
-    ACCESS --> PASSING : servo buka 90° + buzzer 1x
-
-    PASSING --> COUNTDOWN : jarak ≤ 8cm (mobil lewat)
-
-    COUNTDOWN --> CLOSED : hitung mundur 5 detik selesai\nservo tutup 10°
-
-    note right of ACCESS
-        LCD: "AKSES DITERIMA"
-        "PALANG BUKA"
-    end note
-
-    note right of COUNTDOWN
-        LCD: "MENUTUP PALANG"
-        "TUTUP X dtk"
-    end note
+    CAR -->|"RFID tidak cocok"| REJ["AKSES DITOLAK\nBuzzer 3×\nLCD: KARTU INVALID"]
+    REJ --> RETRY["LCD: COBA LAGI"]
+    RETRY --> CAR
 ```
 
 ## Fitur
 
-- **Deteksi kendaraan** — Ultrasonic HY-SR05 dengan median filter 5 sampel & debounce
+- **Deteksi kendaraan** — Ultrasonic HY-SR05 dengan ISR CHANGE + median filter 5 sampel & debounce
 - **Otentikasi RFID** — MFRC522, polling non-blocking di Core 1
 - **Kontrol palang** — Servo SG90, buka 90° / tutup 10°
 - **Indikator buzzer** — 1x beep (diterima), 3x beep cepat (ditolak)
-- **LCD 16×2 I2C** — Menampilkan status sistem, akses, countdown
-- **Sensor cahaya LDR** — Monitoring intensitas cahaya (LED onboard modul)
-- **Countdown 5 detik** — Palang menutup 5 detik setelah mobil lewat (jarak < 8cm)
-- **RTOS multitasking** — 3 task terpisah dengan prioritas & core pinning
+- **LCD 16×2 I2C** — Menampilkan status sistem, akses diterima/ditolak
+- **Sensor cahaya LDR** — ISR CHANGE, monitoring intensitas cahaya (LED onboard modul)
+- **RTOS multitasking** — 3 task terpisah dengan prioritas & core pinning, 2 ISR
 
 ## Komponen
 
@@ -62,10 +51,9 @@ stateDiagram-v2
 | 4 | Kartu RFID (13.56 MHz) | 1 | Media akses |
 | 5 | SG90 Servo | 1 | Membuka/menutup palang |
 | 6 | LCD 16×2 I2C (0x27) | 1 | Menampilkan informasi |
-| 7 | Modul LDR (dengan DO) | 1 | Sensor cahaya |
-| 8 | Passive Buzzer (3.3V) | 1 | Indikator suara |
-| 9 | LED (dengan DO) | 1 | Lampu parkir menyala/mati |
-| 10 | Breadboard + Kabel | - | Rangkaian |
+| 7 | Modul LDR (dengan DO) | 1 | Sensor cahaya + LED indikator |
+| 8 | Active Buzzer (3.3V) | 1 | Indikator suara |
+| 9 | Breadboard + Kabel | - | Rangkaian |
 
 ## Wiring
 
@@ -105,14 +93,13 @@ stateDiagram-v2
 | (+) | GPIO14 |
 | (-) | GND |
 
-### LDR (Modul DO/AO)
+### LDR (Modul DO)
 
 | LDR Module | ESP32 |
 |------------|-------|
 | VCC | 3.3V |
 | GND | GND |
 | DO | GPIO4 |
-<!--| AO | GPIO34 (ADC opsional — uncomment di kode) |-->
 
 ### LCD I2C 16×2
 
@@ -125,29 +112,31 @@ stateDiagram-v2
 
 ## Arsitektur RTOS
 
-ESP32 dual-core menjalankan 3 task FreeRTOS:
+ESP32 dual-core menjalankan 3 task FreeRTOS + 2 ISR:
 
-- **Core 0** — `taskUltrasonic` (priority 2, stack 4096) menangani pembacaan jarak ultrasonik, state machine gate, kontrol servo, serta LCD. ISR `isrEcho` juga terpasang di core ini. `taskLDR` (priority 1, stack 2048) membaca sensor LDR via polling.
-- **Core 1** — `taskRFID` (priority 2, stack 4096) menangani scanning kartu RFID via SPI dan mengecek UID. Hasil dikirim ke taskUltrasonic lewat flag `rfidGranted`.
+- **Core 0** — `ultrasonicTask` (priority 2, stack 4096) menangani trigger ultrasonik & membaca hasil dari ISR `echoISR`, median filter, debounce, serta update LCD. `ldrTask` (priority 1, stack 2048) membaca state dari ISR `ldrISR` dan mencetak ke Serial Monitor.
+- **Core 1** — `rfidTask` (priority 2, stack 4096) menangani scanning kartu RFID via SPI, verifikasi UID, kontrol servo & buzzer, serta update LCD.
 
 ### Sinkronisasi
 
-- **Binary Semaphore (`echoSem`)** — ISR memberi sinyal ke task setelah echo ultrasonik diterima, menggantikan polling loop yang boros CPU
-- **Mutex (`lcdMutex`)** — Mencegah tabrakan akses LCD I2C antar task (`taskUltrasonic` dan `taskRFID`)
+- **ISR `echoISR`** — CHANGE pada ECHO_PIN. `echoStart` dicatat saat RISING, `echoDuration` saat FALLING, flag `echoReady` di-set. ultrasonicTask mereset flag via `portDISABLE_INTERRUPTS()` sebelum trigger untuk atomisitas.
+- **ISR `ldrISR`** — CHANGE pada LDR_DO_PIN. Menyimpan state DO ke `ldrState` dan flag `ldrChanged`. ldrTask membaca flag setiap siklus.
+- **Global flags** — `carDetected`, `gateBusy` diakses antar task tanpa mutex (akses bool/int atomic pada ESP32; delay alami serialisasi akses LCD).
+- **LCD** — Diakses dari ultrasonicTask (status mobil/standby) dan rfidTask (akses diterima/ditolak). Tidak ada race condition karena rfidTask memegang kontrol penuh selama `gateBusy=true`.
 
 ### Priority & Stack
 
 | Task | Core | Priority | Stack | Fungsi |
 |------|:----:|:--------:|:-----:|--------|
-| `taskUltrasonic` | 0 | 2 | 4096 | Ultrasonic + state machine |
-| `taskRFID` | 1 | 2 | 4096 | RFID scanning |
-| `taskLDR` | 0 | 1 | 2048 | Monitoring LDR |
+| `ultrasonicTask` | 0 | 2 | 4096 | Ultrasonic + debounce + LCD |
+| `rfidTask` | 1 | 2 | 4096 | RFID + servo + buzzer + LCD |
+| `ldrTask` | 0 | 1 | 2048 | Monitoring LDR |
 
 ## Pin Mapping
 
 | GPIO | Terhubung ke | Mode |
 |:----:|-------------|:----:|
-| 4 | LDR DO | INPUT |
+| 4 | LDR DO (ISR) | INPUT |
 | 5 | RFID SDA (SS) | OUTPUT |
 | 13 | Servo Signal | OUTPUT (PWM) |
 | 14 | Buzzer (+) | OUTPUT |
@@ -158,7 +147,7 @@ ESP32 dual-core menjalankan 3 task FreeRTOS:
 | 23 | RFID MOSI | OUTPUT |
 | 27 | RFID RST | OUTPUT |
 | 32 | Ultrasonic TRIG | OUTPUT |
-| 33 | Ultrasonic ECHO | INPUT (ISR) |
+| 33 | Ultrasonic ECHO (ISR) | INPUT |
 
 ## Skema Rangkaian (Wokwi)
 
@@ -168,25 +157,23 @@ ESP32 dual-core menjalankan 3 task FreeRTOS:
 
 ## Cara Kerja
 
-1. **Inisialisasi** — ESP32 boot, inisialisasi semua perangkat, buat 3 task FreeRTOS
-2. **Menunggu mobil** — Task ultrasonic membaca jarak setiap ~600ms (median 5 sampel). Jika jarak ≤ 20cm stabil 3× berturut-turut, sistem mendeteksi mobil
-3. **Scan RFID** — Task RFID aktif dan menunggu kartu. Jika UID cocok, akses diberikan
-4. **Palang terbuka** — Servo ke posisi 90°, buzzer 1×, LCD menampilkan "AKSES DITERIMA"
-5. **Mobil lewat** — Sistem menunggu jarak ≤ 8cm (mobil tepat di palang)
-6. **Countdown** — Hitung mundur 5 detik, LCD menampilkan sisa waktu. Tidak bisa dibatalkan
-7. **Palang tertutup** — Servo kembali ke 10°, LCD standby. Siap mendeteksi mobil berikutnya
+1. **Inisialisasi** — ESP32 boot, init semua perangkat, pasang 2 ISR, buat 3 task FreeRTOS
+2. **Menunggu mobil** — `ultrasonicTask` trigger HY-SR05, `echoISR` hitung durasi pulsa Setelah median filter 5 sampel + debounce 3×, jika jarak ≤20cm stabil, `carDetected = true`. LCD: "ADA MOBIL / SCAN RFID"
+3. **Scan RFID** — `rfidTask` aktif (Core 1) polling kartu
+4. **Jika UID cocok** — Buzzer 1×, servo buka 90°, LCD "AKSES DITERIMA / PALANG BUKA". Tunggu 5 detik, servo tutup 10°, LCD standby
+5. **Jika UID tidak cocok** — Buzzer 3×, LCD "AKSES DITOLAK / KARTU INVALID". Tunggu 2 detik, LCD "COBA LAGI / SCAN RFID", bisa scan ulang
+6. **LDR** — `ldrISR` deteksi perubahan cahaya, `ldrTask` cetak ke Serial Monitor
 
 ## Output LCD 16×2
 
 | Kondisi | Baris 1 | Baris 2 |
 |---------|---------|---------|
-| **Sistem standby** | `SELAMAT DATANG` | ` ` |
+| **Sistem standby** | `SMART PARKING` | `SIAP...` |
 | **Mobil terdeteksi** | `ADA MOBIL` | `SCAN RFID` |
 | **Akses diterima** | `AKSES DITERIMA` | `PALANG BUKA` |
 | **Akses ditolak** | `AKSES DITOLAK` | `KARTU INVALID` |
 | **Setelah ditolak** | `COBA LAGI` | `SCAN RFID` |
-| **Countdown aktif** | `MENUTUP PALANG` | `TUTUP 5 dtk` |
-| **Countdown berjalan** | `MENUTUP PALANG` | `TUTUP 4 dtk` (dst) |
+| **Menutup palang** | `MENUTUP PALANG` | `HARAP TUNGGU` |
 
 ## Library Dependencies
 
@@ -197,26 +184,38 @@ ESP32 dual-core menjalankan 3 task FreeRTOS:
 ## Serial Monitor Output
 
 ```
+============================================
+       SMART PARKING — ESP32 FreeRTOS
+============================================
+  [Ultrasonik]   = Ultrasonic HY-SR05
+  [RFID] = MFRC522
+  [LDR]  = Sensor Cahaya DO (LED onboard)
+  [SERVO]= Palang Parkir
+--------------------------------------------
+[SERVO] Init TUTUP 10°
+[ISR]  ECHO terpasang (GPIO 33)
+[ISR]  LDR DO terpasang (GPIO 4)
+[RTOS] Task Ultrasonic -> Core 0, prioritas 2
+[RTOS] Task RFID       -> Core 1, prioritas 2
+[RTOS] Task LDR        -> Core 0, prioritas 1
+--------------------------------------------
+  Sistem berjalan. Monitor di bawah ini:
+============================================
+
+[LDR]  Init — DO: HIGH | Cahaya: GELAP
+[RFID] Status: TIDAK AKTIF (tunggu deteksi mobil)
 [Ultrasonik]   Jarak:  45 cm | Status: KOSONG
 [RFID] Status: TIDAK AKTIF (tunggu deteksi mobil)
-[LDR]  DO: HIGH | Cahaya: GELAP
-----------------------------------------
-[Ultrasonik]   Jarak:  15 cm | Status: ADA MOBIL <<<
-[GATE] CLOSED → CAR_DETECT
+[LDR]  DO: HIGH | Cahaya: GELAP  | LED: NYALA
+[RFID] Status: TIDAK AKTIF (tunggu deteksi mobil)
+[Ultrasonik]   Jarak:  17 cm | Status: ADA MOBIL <<<
 [RFID] Status: AKTIF — menunggu scan kartu...
 [RFID] Kartu terdeteksi — UID: 52 89 16 05
-[RFID] >> AKSES DITERIMA
-[GATE] CAR_DETECT → ACCESS — BUKA PALANG
+[RFID] >> AKSES DITERIMA — palang BUKA 90°
 [SERVO] Posisi: BUKA 90°
-[GATE] PASSING → COUNTDOWN (5dtk)
+[RFID] Status: GATE SIBUK (palang bergerak)
+...
+[SERVO] Menutup palang...
 [SERVO] Posisi: TUTUP 10°
-[GATE] COUNTDOWN → CLOSED
+[RFID] Siklus selesai — sistem kembali standby
 ```
-
-## Lampiran
-
-> [FOTO RANGKAIAN]
->
-> [FOTO REAL]
->
-> [DOKUMENTASI LAINNYA]
